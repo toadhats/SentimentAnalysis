@@ -30,14 +30,35 @@ namespace SentimentAnalysis
 			separatorChar: '\t',
 			hasHeader: true
 			);
+			ITransformer model;
+			// Let's avoid regenerating the model every time if I can!! (this will get more complex when I move this to AWS!!!)
+			if (File.Exists(_modelPath)) // Model has already been created, so just use it
+			{
+				Console.WriteLine($"Model appears to exist already: {_modelPath}");
+				using (var stream = new FileStream(_modelPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+				{
+					model = mlContext.Model.Load(stream);
+				}
+				Console.WriteLine("Model loaded from file.");
+			}
+			else 
+			{
+			 	model = Train(mlContext, _trainDataPath);
+			}
+			
+			#if DEBUG
+			Evaluate(mlContext, model); // Don't REALLY need to evaluate the model every time if it was loaded from file, but may as well for now.
+			#endif
 
-			var model = Train(mlContext, _trainDataPath);
-			Evaluate(mlContext, model);
-
-			Predict(mlContext, model);
-
-			PredictWithModelLoadedFromFile(mlContext);
-
+			// TODO: Make this take JSON message coming in from AWS pipeline instead.
+			var input = StringifyParams(args);
+			var result = Predict(mlContext, model, input);
+			var output = Newtonsoft.Json.JsonConvert.SerializeObject(result);
+			Console.WriteLine(output); // Simulate returning a JSON object to be interpereted elsewhere
+			
+			#if DEBUG // in "production" we'd just want a nice clean JSON object written back to stdout for piping into something else probably (this will need reworking for use as lambda anyway probably)
+			Console.WriteLine($"Sentiment: {(result.Prediction ? "Positive" : "Negative")} | Confidence: {result.Probability}");
+			#endif
 		}
 
 		private static ITransformer Train(MLContext mlContext, string dataPath)
@@ -73,74 +94,25 @@ namespace SentimentAnalysis
 			SaveModelAsFile(mlContext, model); // Save model to disk after evaluation (could be clever and not overwrite an existing model that had a better evaluation?)
 		}
 
-		private static void Predict(MLContext mlContext, ITransformer model)
+		private static SentimentPrediction Predict(MLContext context, ITransformer model, string input) 
 		{
-			var predictionFunction = model.CreatePredictionEngine<SentimentData, SentimentPrediction>(mlContext); // Wrap model in prediction engine
-
-			// Quick test, make this more useful later (paramterize)
-			SentimentData sampleStatement = new SentimentData
-			{
-				SentimentText = "This is a very rude movie"
-			};
-
-			var resultprediction = predictionFunction.Predict(sampleStatement);
-
-			Console.WriteLine();
-			Console.WriteLine("=============== Prediction Test of model with a single sample and test dataset ===============");
-
-			Console.WriteLine();
-			Console.WriteLine($"Sentiment: {sampleStatement.SentimentText} | Prediction: {(Convert.ToBoolean(resultprediction.Prediction) ? "Toxic" : "Not Toxic")} | Probability: {resultprediction.Probability} ");
-			Console.WriteLine("=============== End of Predictions ===============");
-			Console.WriteLine();
-
+			var predictionFunction = model.CreatePredictionEngine<SentimentData, SentimentPrediction>(context); // Wrap model in prediction engine
+			var statement = new SentimentData { SentimentText = input};
+			var result = predictionFunction.Predict(statement);
+			return result;
 		}
-
-		public static void PredictWithModelLoadedFromFile(MLContext mlContext)
-		{
-			IEnumerable<SentimentData> sentiments = new[]
-{
-			new SentimentData
-			{
-				SentimentText = "This is a very rude movie"
-			},
-			new SentimentData
-			{
-				SentimentText = "I love this article."
-			}
-			};
-
-			ITransformer loadedModel;
-			using (var stream = new FileStream(_modelPath, FileMode.Open, FileAccess.Read, FileShare.Read))
-			{
-				loadedModel = mlContext.Model.Load(stream);
-			}
-
-			// Create prediction engine
-			var sentimentStreamingDataView = mlContext.Data.ReadFromEnumerable(sentiments);
-			var predictions = loadedModel.Transform(sentimentStreamingDataView);
-
-			// Use the model to predict whether comment data is toxic (1) or nice (0).
-			var predictedResults = mlContext.CreateEnumerable<SentimentPrediction>(predictions, reuseRowObject: false);
-
-			Console.WriteLine();
-			Console.WriteLine("=============== Prediction Test of loaded model with a multiple samples ===============");
-
-			var sentimentsAndPredictions = sentiments.Zip(predictedResults, (sentiment, prediction) => (sentiment, prediction)); // Zipper together original sentiments/comments and predicted "toxicity"
-
-			foreach (var item in sentimentsAndPredictions)
-			{
-				Console.WriteLine($"Sentiment: {item.sentiment.SentimentText} | Prediction: {(Convert.ToBoolean(item.prediction.Prediction) ? "Toxic" : "Not Toxic")} | Probability: {item.prediction.Probability} ");
-			}
-			Console.WriteLine("=============== End of predictions ===============");
-
-		}
-
 		private static void SaveModelAsFile(MLContext mlContext, ITransformer model)
 		{
 			using (var fs = new FileStream(_modelPath, FileMode.Create, FileAccess.Write, FileShare.Write))
 				mlContext.Model.Save(model, fs);
 
 			Console.WriteLine("Model saved to {0}", _modelPath);
+		}
+
+		/// If input was meant to be wrapped in quotes this would not be necessary
+		private static string StringifyParams(string[] args)
+		{
+			return string.Join(" ", args);
 		}
 	}
 }
